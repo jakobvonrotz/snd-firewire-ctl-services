@@ -13,6 +13,7 @@ pub struct UcxModel {
     cfg_ctl: CfgCtl,
     status_ctl: StatusCtl,
     input_ctl: LatterInputCtl<FfUcxProtocol>,
+    input_mute_ctl: LatterInputMuteCtl<FfUcxProtocol>,
     output_ctl: LatterOutputCtl<FfUcxProtocol>,
     mixer_ctl: LatterMixerCtl<FfUcxProtocol>,
     input_hpf_ctl: LatterInputHpfCtl<FfUcxProtocol>,
@@ -27,6 +28,7 @@ pub struct UcxModel {
     fx_output_ctl: LatterFxOutputCtl<FfUcxProtocol>,
     fx_reverb_ctl: LatterFxReverbCtl<FfUcxProtocol>,
     fx_echo_ctl: LatterFxEchoCtl<FfUcxProtocol>,
+    dsp_report_count: u32,
 }
 
 const TIMEOUT_MS: u32 = 100;
@@ -37,6 +39,7 @@ impl CtlModel<(SndFireface, FwNode)> for UcxModel {
         self.cfg_ctl.cache(&mut self.req, node, TIMEOUT_MS)?;
         self.status_ctl.cache(&mut self.req, node, TIMEOUT_MS)?;
         self.input_ctl.cache(&mut self.req, node, TIMEOUT_MS)?;
+        self.input_mute_ctl.cache(&mut self.req, node, TIMEOUT_MS)?;
         self.output_ctl.cache(&mut self.req, node, TIMEOUT_MS)?;
         self.mixer_ctl.cache(&mut self.req, node, TIMEOUT_MS)?;
         self.input_hpf_ctl.cache(&mut self.req, node, TIMEOUT_MS)?;
@@ -60,6 +63,7 @@ impl CtlModel<(SndFireface, FwNode)> for UcxModel {
         self.cfg_ctl.load(card_cntr)?;
         self.status_ctl.load(card_cntr)?;
         self.input_ctl.load(card_cntr)?;
+        self.input_mute_ctl.load(card_cntr)?;
         self.output_ctl.load(card_cntr)?;
         self.mixer_ctl.load(card_cntr)?;
         self.input_hpf_ctl.load(card_cntr)?;
@@ -85,6 +89,8 @@ impl CtlModel<(SndFireface, FwNode)> for UcxModel {
         } else if self.status_ctl.read(elem_id, elem_value)? {
             Ok(true)
         } else if self.input_ctl.read(elem_id, elem_value)? {
+            Ok(true)
+        } else if self.input_mute_ctl.read(elem_id, elem_value)? {
             Ok(true)
         } else if self.output_ctl.read(elem_id, elem_value)? {
             Ok(true)
@@ -132,6 +138,11 @@ impl CtlModel<(SndFireface, FwNode)> for UcxModel {
             Ok(true)
         } else if self
             .input_ctl
+            .write(&mut self.req, node, elem_id, elem_value, TIMEOUT_MS)?
+        {
+            Ok(true)
+        } else if self
+            .input_mute_ctl
             .write(&mut self.req, node, elem_id, elem_value, TIMEOUT_MS)?
         {
             Ok(true)
@@ -208,6 +219,63 @@ impl CtlModel<(SndFireface, FwNode)> for UcxModel {
         } else {
             Ok(false)
         }
+    }
+}
+
+// TotalMix FX requests the state dump about 10 polls after start.
+const DSP_STATE_DUMP_POLL: u32 = 10;
+
+impl DspReportModel<(SndFireface, FwNode)> for UcxModel {
+    fn dsp_report_available(&self) -> bool {
+        true
+    }
+
+    fn poll_dsp_reports(
+        &mut self,
+        (_, node): &mut (SndFireface, FwNode),
+        elem_id_list: &mut Vec<ElemId>,
+    ) -> Result<(), Error> {
+        let count = self.dsp_report_count;
+        self.dsp_report_count = count.saturating_add(1);
+
+        FfUcxProtocol::send_dsp_heartbeat(&mut self.req, node, count as u8, TIMEOUT_MS)?;
+        if count == DSP_STATE_DUMP_POLL {
+            // The device then reports every parameter, e.g. the mic gains set with the knob.
+            FfUcxProtocol::request_dsp_state_dump(&mut self.req, node, TIMEOUT_MS)?;
+        }
+
+        let reports = FfUcxProtocol::read_dsp_reports(&mut self.req, node, TIMEOUT_MS)?;
+        if reports.is_empty() {
+            return Ok(());
+        }
+        debug!(?reports);
+
+        let mut changed = [false; 7];
+        reports.iter().for_each(|r| {
+            changed[0] |= self.input_ctl.parse_report(r);
+            changed[1] |= self.input_mute_ctl.parse_report(r);
+            changed[2] |= self.output_ctl.parse_report(r);
+            changed[3] |= self.fx_source_ctl.parse_report(r);
+            changed[4] |= self.fx_output_ctl.parse_report(r);
+            changed[5] |= self.fx_reverb_ctl.parse_report(r);
+            changed[6] |= self.fx_echo_ctl.parse_report(r);
+        });
+
+        [
+            &self.input_ctl.elem_id_list,
+            &self.input_mute_ctl.elem_id_list,
+            &self.output_ctl.elem_id_list,
+            &self.fx_source_ctl.elem_id_list,
+            &self.fx_output_ctl.elem_id_list,
+            &self.fx_reverb_ctl.elem_id_list,
+            &self.fx_echo_ctl.elem_id_list,
+        ]
+        .iter()
+        .zip(changed)
+        .filter(|(_, c)| *c)
+        .for_each(|(list, _)| elem_id_list.extend_from_slice(list));
+
+        Ok(())
     }
 }
 

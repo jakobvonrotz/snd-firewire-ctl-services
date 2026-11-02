@@ -166,12 +166,36 @@ fn read_status<T: RmeFfOffsetParamsDeserialize<U>, U>(
     .map(|_| T::deserialize_offsets(status, &raw))
 }
 
+/// Pair each physical input value with its channel number. Line and microphone inputs are placed
+/// per model; digital inputs follow both of them.
+fn phys_input_channels<'a, T, S>(
+    line: &'a [S],
+    mic: &'a [S],
+    digital: impl Iterator<Item = &'a S> + 'a,
+) -> impl Iterator<Item = (usize, S)> + 'a
+where
+    T: RmeFfLatterSpecification,
+    S: Copy + 'a,
+{
+    let digital_offset = T::LINE_INPUT_COUNT + T::MIC_INPUT_COUNT;
+    line.iter()
+        .enumerate()
+        .map(|(i, &v)| (T::LINE_INPUT_OFFSET + i, v))
+        .chain(mic.iter().enumerate().map(|(i, &v)| (T::MIC_INPUT_OFFSET + i, v)))
+        .chain(digital.enumerate().map(move |(i, &v)| (digital_offset + i, v)))
+}
+
 /// The specification of latter model.
 pub trait RmeFfLatterSpecification {
     /// The number of line inputs.
     const LINE_INPUT_COUNT: usize;
     /// The number of microphone inputs.
     const MIC_INPUT_COUNT: usize;
+    /// The first physical channel of line inputs. The 802 has line inputs first, while the UCX
+    /// has its microphone preamps at channel 0-1.
+    const LINE_INPUT_OFFSET: usize = 0;
+    /// The first physical channel of microphone inputs.
+    const MIC_INPUT_OFFSET: usize = Self::LINE_INPUT_COUNT;
     /// The number of S/PDIF inputs.
     const SPDIF_INPUT_COUNT: usize;
     /// The number of ADAT inputs.
@@ -189,6 +213,11 @@ pub trait RmeFfLatterSpecification {
     const SPDIF_OUTPUT_COUNT: usize;
     /// The number of ADAT outputs.
     const ADAT_OUTPUT_COUNT: usize;
+
+    /// The size of each chunk of meter data in bytes. The last quadlet is the tag.
+    const METER_CHUNK_SIZE: usize = 392;
+    /// The offset of quadlets for meter levels in each chunk.
+    const METER_LEVEL_OFFSET: usize = 256;
 }
 
 /// State of meters.
@@ -217,7 +246,6 @@ pub struct FfLatterMeterState {
     pub adat_outputs: Vec<i32>,
 }
 
-const METER_CHUNK_SIZE: usize = 392;
 const METER_CHUNK_COUNT: usize = 5;
 const METER32_MASK: i32 = 0x07fffff0;
 
@@ -260,10 +288,10 @@ impl<O: RmeFfLatterSpecification> RmeFfLatterMeterSpecification for O {}
 //  The maximum value for quadlet is 0x07fffff0. The byte in LSB is 0xf at satulated.
 impl<O: RmeFfLatterMeterSpecification> RmeFfOffsetParamsDeserialize<FfLatterMeterState> for O {
     fn deserialize_offsets(state: &mut FfLatterMeterState, raw: &[u8]) {
-        assert_eq!(raw.len(), METER_CHUNK_SIZE);
+        assert_eq!(raw.len(), Self::METER_CHUNK_SIZE);
 
         let mut quadlet = [0; 4];
-        quadlet.copy_from_slice(&raw[(METER_CHUNK_SIZE - 4)..]);
+        quadlet.copy_from_slice(&raw[(Self::METER_CHUNK_SIZE - 4)..]);
         let target = u32::from_le_bytes(quadlet);
 
         match target {
@@ -284,7 +312,7 @@ impl<O: RmeFfLatterMeterSpecification> RmeFfOffsetParamsDeserialize<FfLatterMete
                 .iter_mut()
                 .for_each(|(iter, offset)| {
                     iter.enumerate().for_each(|(i, meter)| {
-                        let pos = 256 + (*offset + i) * 4;
+                        let pos = Self::METER_LEVEL_OFFSET + (*offset + i) * 4;
                         quadlet.copy_from_slice(&raw[pos..(pos + 4)]);
                         *meter = i32::from_le_bytes(quadlet) & METER32_MASK;
                     });
@@ -297,7 +325,7 @@ impl<O: RmeFfLatterMeterSpecification> RmeFfOffsetParamsDeserialize<FfLatterMete
                     .iter_mut()
                     .enumerate()
                     .for_each(|(i, meter)| {
-                        let pos = 256 + i * 4;
+                        let pos = Self::METER_LEVEL_OFFSET + i * 4;
                         quadlet.copy_from_slice(&raw[pos..(pos + 4)]);
                         *meter = i32::from_le_bytes(quadlet) & METER32_MASK;
                     });
@@ -305,8 +333,8 @@ impl<O: RmeFfLatterMeterSpecification> RmeFfOffsetParamsDeserialize<FfLatterMete
             // For phys inputs.
             0x66666666 => {
                 [
-                    (state.line_inputs.iter_mut(), 0),
-                    (state.mic_inputs.iter_mut(), Self::LINE_INPUT_COUNT),
+                    (state.line_inputs.iter_mut(), Self::LINE_INPUT_OFFSET),
+                    (state.mic_inputs.iter_mut(), Self::MIC_INPUT_OFFSET),
                     (
                         state.spdif_inputs.iter_mut(),
                         Self::LINE_INPUT_COUNT + Self::MIC_INPUT_COUNT,
@@ -319,7 +347,7 @@ impl<O: RmeFfLatterMeterSpecification> RmeFfOffsetParamsDeserialize<FfLatterMete
                 .iter_mut()
                 .for_each(|(iter, offset)| {
                     iter.enumerate().for_each(|(i, meter)| {
-                        let pos = 256 + (*offset + i) * 4;
+                        let pos = Self::METER_LEVEL_OFFSET + (*offset + i) * 4;
                         quadlet.copy_from_slice(&raw[pos..(pos + 4)]);
                         *meter = i32::from_le_bytes(quadlet) & METER32_MASK;
                     });
@@ -332,7 +360,7 @@ impl<O: RmeFfLatterMeterSpecification> RmeFfOffsetParamsDeserialize<FfLatterMete
 
 impl<O> RmeFfCacheableParamsOperation<FfLatterMeterState> for O
 where
-    O: RmeFfOffsetParamsDeserialize<FfLatterMeterState>,
+    O: RmeFfOffsetParamsDeserialize<FfLatterMeterState> + RmeFfLatterSpecification,
 {
     fn cache_wholly(
         req: &mut FwReq,
@@ -341,7 +369,7 @@ where
         timeout_ms: u32,
     ) -> Result<(), Error> {
         (0..METER_CHUNK_COUNT).try_for_each(|_| {
-            let mut raw = vec![0; METER_CHUNK_SIZE];
+            let mut raw = vec![0; Self::METER_CHUNK_SIZE];
             req.transaction(
                 node,
                 FwTcode::ReadBlockRequest,
@@ -704,12 +732,12 @@ impl<O: RmeFfLatterInputSpecification> RmeFfCommandParamsSerialize<FfLatterInput
             });
 
         state.line_gains.iter().enumerate().for_each(|(i, &gain)| {
-            let ch = i as u8;
+            let ch = (Self::LINE_INPUT_OFFSET + i) as u8;
             cmds.push(create_phys_port_cmd(ch, INPUT_LINE_GAIN_CMD, gain as i16));
         });
 
         state.line_levels.iter().enumerate().for_each(|(i, level)| {
-            let ch = i as u8;
+            let ch = (Self::LINE_INPUT_OFFSET + i) as u8;
             cmds.push(create_phys_port_cmd(
                 ch,
                 INPUT_LINE_LEVEL_CMD,
@@ -719,7 +747,7 @@ impl<O: RmeFfLatterInputSpecification> RmeFfCommandParamsSerialize<FfLatterInput
 
         (0..Self::MIC_INPUT_COUNT).for_each(|i| {
             // NOTE: The offset is required for microphone inputs.
-            let ch = (Self::LINE_INPUT_COUNT + i) as u8;
+            let ch = (Self::MIC_INPUT_OFFSET + i) as u8;
 
             let cmd = create_phys_port_cmd(ch, INPUT_MIC_INST_CMD, state.mic_insts[i] as i16);
             cmds.push(cmd);
@@ -732,6 +760,53 @@ impl<O: RmeFfLatterInputSpecification> RmeFfCommandParamsSerialize<FfLatterInput
         });
 
         cmds
+    }
+}
+
+/// Gain of microphone preamps (command 0x07 on the mic channels).
+///
+/// The value is in 0.1 dB steps, e.g. 430 means 43 dB. Confirmed on the Fireface UCX, whose
+/// front knob offers 0 dB and 10..60 dB. This state is never written wholly at startup, so the
+/// device keeps the gain set with the knob until a new value is commanded partially.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FfLatterMicGainState {
+    /// The gain of each microphone input, in 0.1 dB.
+    pub gains: Vec<i16>,
+}
+
+/// The specification of microphone preamp gain.
+pub trait RmeFfLatterMicGainSpecification: RmeFfLatterDspSpecification {
+    /// The minimum gain, in 0.1 dB.
+    const MIC_INPUT_GAIN_MIN: i32 = 0;
+    /// The maximum gain, in 0.1 dB.
+    const MIC_INPUT_GAIN_MAX: i32 = 600;
+    /// The step of gain, in 0.1 dB.
+    const MIC_INPUT_GAIN_STEP: i32 = 10;
+
+    /// Instantiate microphone gain parameters. The values are unknown until commanded, so each
+    /// is set to -1 so that any first command differs from it.
+    fn create_mic_gain_parameters() -> FfLatterMicGainState {
+        FfLatterMicGainState {
+            gains: vec![-1; Self::MIC_INPUT_COUNT],
+        }
+    }
+}
+
+impl<O: RmeFfLatterDspSpecification> RmeFfLatterMicGainSpecification for O {}
+
+impl<O: RmeFfLatterMicGainSpecification> RmeFfCommandParamsSerialize<FfLatterMicGainState> for O {
+    fn serialize_commands(state: &FfLatterMicGainState) -> Vec<u32> {
+        assert_eq!(state.gains.len(), Self::MIC_INPUT_COUNT);
+
+        state
+            .gains
+            .iter()
+            .enumerate()
+            .map(|(i, &gain)| {
+                let ch = (Self::MIC_INPUT_OFFSET + i) as u8;
+                create_phys_port_cmd(ch, INPUT_LINE_GAIN_CMD, gain)
+            })
+            .collect()
     }
 }
 
@@ -975,19 +1050,31 @@ impl<O: RmeFfLatterMixerSpecification> RmeFfCommandParamsSerialize<FfLatterMixer
             .enumerate()
             .flat_map(|(i, mixer)| {
                 let index = i as u16;
-                mixer
-                    .line_gains
+                // Physical inputs are at channel 0 onward, while fx returns and stream inputs
+                // are at fixed offsets just below and from STREAM_OFFSET (0x20) regardless of
+                // the number of physical inputs. Contiguous numbering only coincides with this
+                // layout for models with 30 physical inputs (802); for UCX (18) it misplaced
+                // stream sources at 0x14.
+                let phys = phys_input_channels::<Self, _>(
+                    &mixer.line_gains,
+                    &mixer.mic_gains,
+                    mixer.spdif_gains.iter().chain(&mixer.adat_gains),
+                )
+                .map(|(ch, gain)| (ch as u16, gain));
+                let fx_return_offset = Self::STREAM_OFFSET - mixer.fx_return_gains.len() as u16;
+                let fx_returns = mixer
+                    .fx_return_gains
                     .iter()
-                    .chain(&mixer.mic_gains)
-                    .chain(&mixer.spdif_gains)
-                    .chain(&mixer.adat_gains)
-                    .chain(&mixer.fx_return_gains)
-                    .chain(&mixer.stream_gains)
                     .enumerate()
-                    .map(|(j, &gain)| {
-                        let ch = j as u16;
-                        create_virt_port_cmd(Self::MIXER_STEP, index, ch, gain)
-                    })
+                    .map(move |(j, &gain)| (fx_return_offset + j as u16, gain));
+                let streams = mixer
+                    .stream_gains
+                    .iter()
+                    .enumerate()
+                    .map(|(j, &gain)| (Self::STREAM_OFFSET + j as u16, gain));
+                phys.chain(fx_returns)
+                    .chain(streams)
+                    .map(|(ch, gain)| create_virt_port_cmd(Self::MIXER_STEP, index, ch, gain))
                     .collect::<Vec<u32>>()
             })
             .collect()
@@ -1652,17 +1739,14 @@ where
     fn serialize_commands(params: &FfLatterFxSourceParameters) -> Vec<u32> {
         let mut cmds = Vec::new();
 
-        params
-            .line_input_gains
-            .iter()
-            .chain(&params.mic_input_gains)
-            .chain(&params.spdif_input_gains)
-            .chain(&params.adat_input_gains)
-            .enumerate()
-            .for_each(|(i, &gain)| {
-                let ch = i as u8;
-                cmds.push(create_phys_port_cmd(ch, INPUT_TO_FX_CMD, gain));
-            });
+        phys_input_channels::<Self, _>(
+            &params.line_input_gains,
+            &params.mic_input_gains,
+            params.spdif_input_gains.iter().chain(&params.adat_input_gains),
+        )
+        .for_each(|(ch, gain)| {
+            cmds.push(create_phys_port_cmd(ch as u8, INPUT_TO_FX_CMD, gain));
+        });
 
         params
             .stream_input_gains
@@ -2135,6 +2219,424 @@ pub trait RmeFfLatterFxSpecification: RmeFfLatterDspSpecification {
 }
 
 impl<O: RmeFfLatterDspSpecification> RmeFfLatterFxSpecification for O {}
+
+const INPUT_MUTE_CMD: u8 = 0x00;
+
+/// Mute of physical inputs (command 0x00 on the input channels).
+///
+/// On the Fireface UCX this switch blocks at least the send to the FX bus: with it set, echo and
+/// reverb stay silent even with the send and return opened, while the dry signal still reaches
+/// the mixer. TotalMix FX calls the parameter "mute". The device keeps the last value, so it is
+/// written wholly at startup like the other input parameters.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FfLatterInputMuteState {
+    /// Whether to mute each physical input.
+    pub mutes: Vec<bool>,
+}
+
+/// The specification of input mute.
+pub trait RmeFfLatterInputMuteSpecification: RmeFfLatterDspSpecification {
+    /// Instantiate input mute parameters, all unmuted.
+    fn create_input_mute_parameters() -> FfLatterInputMuteState {
+        FfLatterInputMuteState {
+            mutes: vec![false; Self::PHYS_INPUT_COUNT],
+        }
+    }
+}
+
+impl<O: RmeFfLatterDspSpecification> RmeFfLatterInputMuteSpecification for O {}
+
+impl<O: RmeFfLatterInputMuteSpecification> RmeFfCommandParamsSerialize<FfLatterInputMuteState>
+    for O
+{
+    fn serialize_commands(state: &FfLatterInputMuteState) -> Vec<u32> {
+        assert_eq!(state.mutes.len(), Self::PHYS_INPUT_COUNT);
+
+        state
+            .mutes
+            .iter()
+            .enumerate()
+            .map(|(i, &mute)| create_phys_port_cmd(i as u8, INPUT_MUTE_CMD, mute as i16))
+            .collect()
+    }
+}
+
+// The DSP reports parameter changes, e.g. by the gain knob, through a FIFO. The host has to write
+// a heartbeat command periodically, otherwise nothing is reported. TotalMix FX writes it every
+// about 20 ms when it has no other command to send.
+const DSP_FIFO_COUNT_OFFSET: u64 = 0xffffff200000;
+const DSP_FIFO_DATA_OFFSET: u64 = 0xffffff100000;
+const DSP_FIFO_MAX_SIZE: usize = 0x400;
+const DSP_HEARTBEAT_CMD: u32 = 0x3f000000;
+// Request the DSP to report the current value of every parameter.
+const DSP_STATE_DUMP_CMD: u32 = 0x3f990812;
+const DSP_STATUS_CH: u8 = 0x3f;
+
+/// A parameter value reported by the DSP. It has the same layout as a command for physical port.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FfLatterDspReport {
+    /// The channel.
+    pub ch: u8,
+    /// The command code.
+    pub cmd: u8,
+    /// The value.
+    pub value: i16,
+}
+
+impl FfLatterDspReport {
+    /// Parse a word read from the FIFO. Words with wrong parity, words for virtual ports, and
+    /// status words (channel 0x3f) are dropped.
+    pub fn parse(word: u32) -> Option<Self> {
+        if word.count_ones() % 2 == 0 || word & VIRT_PORT_CMD_FLAG > 0 {
+            return None;
+        }
+        let ch = ((word >> 24) & 0x3f) as u8;
+        if ch == DSP_STATUS_CH {
+            return None;
+        }
+        Some(Self {
+            ch,
+            cmd: ((word >> 16) & 0xff) as u8,
+            value: (word & 0xffff) as u16 as i16,
+        })
+    }
+}
+
+/// Operation for parameter reports by the DSP.
+pub trait RmeFfLatterDspReportOperation: RmeFfLatterDspSpecification {
+    /// Write the heartbeat. The counter is masked to 4 bits.
+    fn send_dsp_heartbeat(
+        req: &mut FwReq,
+        node: &mut FwNode,
+        counter: u8,
+        timeout_ms: u32,
+    ) -> Result<(), Error> {
+        write_dsp_cmd(
+            req,
+            node,
+            DSP_HEARTBEAT_CMD | (counter & 0x0f) as u32,
+            timeout_ms,
+        )
+    }
+
+    /// Request the DSP to report every parameter.
+    fn request_dsp_state_dump(
+        req: &mut FwReq,
+        node: &mut FwNode,
+        timeout_ms: u32,
+    ) -> Result<(), Error> {
+        write_dsp_cmd(req, node, DSP_STATE_DUMP_CMD, timeout_ms)
+    }
+
+    /// Read the pending reports from the FIFO.
+    fn read_dsp_reports(
+        req: &mut FwReq,
+        node: &mut FwNode,
+        timeout_ms: u32,
+    ) -> Result<Vec<FfLatterDspReport>, Error> {
+        let mut raw = [0; 4];
+        req.transaction(
+            node,
+            FwTcode::ReadQuadletRequest,
+            DSP_FIFO_COUNT_OFFSET,
+            raw.len(),
+            &mut raw,
+            timeout_ms,
+        )?;
+        let size = u32::from_le_bytes(raw) as usize;
+        if size == 0 || size > DSP_FIFO_MAX_SIZE {
+            return Ok(Vec::new());
+        }
+        let size = size / 4 * 4;
+        if size == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut raw = vec![0; size];
+        req.transaction(
+            node,
+            FwTcode::ReadBlockRequest,
+            DSP_FIFO_DATA_OFFSET,
+            raw.len(),
+            &mut raw,
+            timeout_ms,
+        )?;
+
+        Ok(raw
+            .chunks_exact(4)
+            .filter_map(|q| FfLatterDspReport::parse(u32::from_le_bytes([q[0], q[1], q[2], q[3]])))
+            .collect())
+    }
+}
+
+impl<O: RmeFfLatterDspSpecification> RmeFfLatterDspReportOperation for O {}
+
+/// Apply a report by the DSP to parameters.
+pub trait RmeFfCommandParamsParseReport<T> {
+    /// Update the parameters by the report. Return true when any value changed.
+    fn parse_report(params: &mut T, report: &FfLatterDspReport) -> bool;
+}
+
+fn update_value<V: PartialEq>(slot: Option<&mut V>, value: V) -> bool {
+    match slot {
+        Some(s) if *s != value => {
+            *s = value;
+            true
+        }
+        _ => false,
+    }
+}
+
+// Index of a value for line/mic inputs, or None.
+fn line_input_index<T: RmeFfLatterSpecification>(ch: usize) -> Option<usize> {
+    (ch >= T::LINE_INPUT_OFFSET && ch < T::LINE_INPUT_OFFSET + T::LINE_INPUT_COUNT)
+        .then(|| ch - T::LINE_INPUT_OFFSET)
+}
+
+fn mic_input_index<T: RmeFfLatterSpecification>(ch: usize) -> Option<usize> {
+    (ch >= T::MIC_INPUT_OFFSET && ch < T::MIC_INPUT_OFFSET + T::MIC_INPUT_COUNT)
+        .then(|| ch - T::MIC_INPUT_OFFSET)
+}
+
+// Index of a physical output, or None.
+fn output_index<T: RmeFfLatterDspSpecification>(ch: usize) -> Option<usize> {
+    (ch >= T::PHYS_INPUT_COUNT && ch < T::PHYS_INPUT_COUNT + T::OUTPUT_COUNT)
+        .then(|| ch - T::PHYS_INPUT_COUNT)
+}
+
+impl<O: RmeFfLatterInputSpecification> RmeFfCommandParamsParseReport<FfLatterInputState> for O {
+    fn parse_report(state: &mut FfLatterInputState, report: &FfLatterDspReport) -> bool {
+        let ch = report.ch as usize;
+        if ch >= Self::PHYS_INPUT_COUNT {
+            return false;
+        }
+        let on = report.value != 0;
+        match report.cmd {
+            INPUT_STEREO_LINK_CMD => update_value(state.stereo_links.get_mut(ch / 2), on),
+            INPUT_INVERT_PHASE_CMD => update_value(state.invert_phases.get_mut(ch), on),
+            INPUT_LINE_GAIN_CMD => line_input_index::<Self>(ch)
+                .map(|i| update_value(state.line_gains.get_mut(i), report.value))
+                .unwrap_or(false),
+            // The same command code is used for nominal level of line inputs and phantom powering
+            // of mic inputs.
+            INPUT_LINE_LEVEL_CMD => {
+                if let Some(i) = line_input_index::<Self>(ch) {
+                    let level = match report.value {
+                        0 => LatterInNominalLevel::Low,
+                        1 => LatterInNominalLevel::Professional,
+                        _ => return false,
+                    };
+                    update_value(state.line_levels.get_mut(i), level)
+                } else if let Some(i) = mic_input_index::<Self>(ch) {
+                    update_value(state.mic_powers.get_mut(i), on)
+                } else {
+                    false
+                }
+            }
+            INPUT_MIC_INST_CMD => mic_input_index::<Self>(ch)
+                .map(|i| update_value(state.mic_insts.get_mut(i), on))
+                .unwrap_or(false),
+            _ => false,
+        }
+    }
+}
+
+impl<O: RmeFfLatterMicGainSpecification> RmeFfCommandParamsParseReport<FfLatterMicGainState>
+    for O
+{
+    fn parse_report(state: &mut FfLatterMicGainState, report: &FfLatterDspReport) -> bool {
+        if report.cmd != INPUT_LINE_GAIN_CMD {
+            return false;
+        }
+        mic_input_index::<Self>(report.ch as usize)
+            .map(|i| update_value(state.gains.get_mut(i), report.value))
+            .unwrap_or(false)
+    }
+}
+
+impl<O: RmeFfLatterInputMuteSpecification> RmeFfCommandParamsParseReport<FfLatterInputMuteState>
+    for O
+{
+    fn parse_report(state: &mut FfLatterInputMuteState, report: &FfLatterDspReport) -> bool {
+        if report.cmd != INPUT_MUTE_CMD {
+            return false;
+        }
+        update_value(state.mutes.get_mut(report.ch as usize), report.value != 0)
+    }
+}
+
+impl<O: RmeFfLatterOutputSpecification> RmeFfCommandParamsParseReport<FfLatterOutputState> for O {
+    fn parse_report(state: &mut FfLatterOutputState, report: &FfLatterDspReport) -> bool {
+        let i = match output_index::<Self>(report.ch as usize) {
+            Some(i) => i,
+            None => return false,
+        };
+        let on = report.value != 0;
+        match report.cmd {
+            OUTPUT_VOL_CMD => update_value(state.vols.get_mut(i), report.value),
+            OUTPUT_STEREO_BALANCE_CMD if i % 2 == 0 => {
+                update_value(state.stereo_balance.get_mut(i / 2), report.value)
+            }
+            OUTPUT_STEREO_LINK_CMD => update_value(state.stereo_links.get_mut(i / 2), on),
+            OUTPUT_INVERT_PHASE_CMD => update_value(state.invert_phases.get_mut(i), on),
+            OUTPUT_LINE_LEVEL_CMD => {
+                let level = match report.value {
+                    0 => LineOutNominalLevel::Consumer,
+                    1 => LineOutNominalLevel::Professional,
+                    2 => LineOutNominalLevel::High,
+                    _ => return false,
+                };
+                update_value(state.line_levels.get_mut(i), level)
+            }
+            _ => false,
+        }
+    }
+}
+
+impl<O: RmeFfLatterFxSpecification> RmeFfCommandParamsParseReport<FfLatterFxSourceParameters>
+    for O
+{
+    fn parse_report(params: &mut FfLatterFxSourceParameters, report: &FfLatterDspReport) -> bool {
+        if report.cmd != INPUT_TO_FX_CMD {
+            return false;
+        }
+        let ch = report.ch as usize;
+        let digital_offset = Self::LINE_INPUT_COUNT + Self::MIC_INPUT_COUNT;
+        let slot = if let Some(i) = line_input_index::<Self>(ch) {
+            params.line_input_gains.get_mut(i)
+        } else if let Some(i) = mic_input_index::<Self>(ch) {
+            params.mic_input_gains.get_mut(i)
+        } else if ch >= digital_offset && ch < Self::PHYS_INPUT_COUNT {
+            let i = ch - digital_offset;
+            if i < Self::SPDIF_INPUT_COUNT {
+                params.spdif_input_gains.get_mut(i)
+            } else {
+                params.adat_input_gains.get_mut(i - Self::SPDIF_INPUT_COUNT)
+            }
+        } else {
+            None
+        };
+        update_value(slot, report.value)
+    }
+}
+
+impl<O: RmeFfLatterFxSpecification> RmeFfCommandParamsParseReport<FfLatterFxOutputParameters>
+    for O
+{
+    fn parse_report(params: &mut FfLatterFxOutputParameters, report: &FfLatterDspReport) -> bool {
+        if report.cmd != OUTPUT_FROM_FX_CMD {
+            return false;
+        }
+        let mut i = match output_index::<Self>(report.ch as usize) {
+            Some(i) => i,
+            None => return false,
+        };
+        for vols in [
+            &mut params.line_output_vols,
+            &mut params.hp_output_vols,
+            &mut params.spdif_output_vols,
+            &mut params.adat_output_vols,
+        ] {
+            if i < vols.len() {
+                return update_value(vols.get_mut(i), report.value);
+            }
+            i -= vols.len();
+        }
+        false
+    }
+}
+
+fn serialize_fx_reverb_type(value: i16) -> Option<FfLatterFxReverbType> {
+    [
+        FfLatterFxReverbType::SmallRoom,
+        FfLatterFxReverbType::MediumRoom,
+        FfLatterFxReverbType::LargeRoom,
+        FfLatterFxReverbType::Walls,
+        FfLatterFxReverbType::Shorty,
+        FfLatterFxReverbType::Attack,
+        FfLatterFxReverbType::Swagger,
+        FfLatterFxReverbType::OldSchool,
+        FfLatterFxReverbType::Echoistic,
+        FfLatterFxReverbType::EightPlusNine,
+        FfLatterFxReverbType::GrandWide,
+        FfLatterFxReverbType::Thicker,
+        FfLatterFxReverbType::Envelope,
+        FfLatterFxReverbType::Gated,
+        FfLatterFxReverbType::Space,
+    ]
+    .iter()
+    .copied()
+    .find(|t| deserialize_fx_reverb_type(t) == value)
+}
+
+impl<O: RmeFfLatterFxSpecification> RmeFfCommandParamsParseReport<FfLatterFxReverbState> for O {
+    fn parse_report(state: &mut FfLatterFxReverbState, report: &FfLatterDspReport) -> bool {
+        if report.ch != FX_CH {
+            return false;
+        }
+        let v = report.value;
+        let u = v as u16;
+        match report.cmd {
+            FX_REVERB_ACTIVATE_CMD => update_value(Some(&mut state.activate), v != 0),
+            FX_REVERB_TYPE_CMD => match serialize_fx_reverb_type(v) {
+                Some(t) => update_value(Some(&mut state.reverb_type), t),
+                None => false,
+            },
+            FX_REVERB_PRE_DELAY_CMD => update_value(Some(&mut state.pre_delay), u),
+            FX_REVERB_PRE_HPF_FREQ_CMD => update_value(Some(&mut state.pre_hpf), u),
+            FX_REVERB_ROOM_SCALE_CMD => update_value(Some(&mut state.room_scale), u),
+            FX_REVERB_ATTACK_CMD => update_value(Some(&mut state.attack), u),
+            FX_REVERB_HOLD_CMD => update_value(Some(&mut state.hold), u),
+            FX_REVERB_RELEASE_CMD => update_value(Some(&mut state.release), u),
+            FX_REVERB_POST_LPF_FREQ_CMD => update_value(Some(&mut state.post_lpf), u),
+            FX_REVERB_TIME_CMD => update_value(Some(&mut state.time), u),
+            FX_REVERB_DAMPING_FREQ_CMD => update_value(Some(&mut state.damping), u),
+            FX_REVERB_SMOOTH_CMD => update_value(Some(&mut state.smooth), u),
+            FX_REVERB_VOLUME_CMD => update_value(Some(&mut state.volume), v),
+            FX_REVERB_STEREO_WIDTH_CMD => update_value(Some(&mut state.stereo_width), u),
+            _ => false,
+        }
+    }
+}
+
+impl<O: RmeFfLatterFxSpecification> RmeFfCommandParamsParseReport<FfLatterFxEchoState> for O {
+    fn parse_report(state: &mut FfLatterFxEchoState, report: &FfLatterDspReport) -> bool {
+        if report.ch != FX_CH {
+            return false;
+        }
+        let v = report.value;
+        let u = v as u16;
+        match report.cmd {
+            FX_ECHO_ACTIVATE_CMD => update_value(Some(&mut state.activate), v != 0),
+            FX_ECHO_TYPE_CMD => {
+                let t = match v {
+                    0 => FfLatterFxEchoType::StereoEcho,
+                    1 => FfLatterFxEchoType::StereoCross,
+                    2 => FfLatterFxEchoType::PongEcho,
+                    _ => return false,
+                };
+                update_value(Some(&mut state.echo_type), t)
+            }
+            FX_ECHO_DELAY_CMD => update_value(Some(&mut state.delay), u),
+            FX_ECHO_FEEDBACK_CMD => update_value(Some(&mut state.feedback), u),
+            FX_ECHO_LPF_FREQ_CMD => {
+                let f = match v {
+                    0 => FfLatterFxEchoLpfFreq::Off,
+                    5 => FfLatterFxEchoLpfFreq::H2000,
+                    4 => FfLatterFxEchoLpfFreq::H4000,
+                    3 => FfLatterFxEchoLpfFreq::H8000,
+                    2 => FfLatterFxEchoLpfFreq::H12000,
+                    1 => FfLatterFxEchoLpfFreq::H16000,
+                    _ => return false,
+                };
+                update_value(Some(&mut state.lpf), f)
+            }
+            FX_ECHO_VOLUME_CMD => update_value(Some(&mut state.volume), v),
+            FX_ECHO_STEREO_WIDTH_CMD => update_value(Some(&mut state.stereo_width), u),
+            _ => false,
+        }
+    }
+}
 
 #[cfg(test)]
 mod test {

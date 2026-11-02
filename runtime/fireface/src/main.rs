@@ -107,6 +107,10 @@ const NODE_DISPATCHER_NAME: &str = "node event dispatcher";
 const SYSTEM_DISPATCHER_NAME: &str = "system event dispatcher";
 const TIMER_DISPATCHER_NAME: &str = "interval timer dispatcher";
 
+const DSP_REPORT_DISPATCHER_NAME: &str = "dsp report dispatcher";
+// TotalMix FX polls every about 20 ms.
+const DSP_REPORT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(25);
+
 const TIMER_NAME: &str = "metering";
 const TIMER_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
 

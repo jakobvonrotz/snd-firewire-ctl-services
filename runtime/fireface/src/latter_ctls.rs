@@ -127,6 +127,7 @@ const INPUT_STEREO_LINK_NAME: &str = "input:stereo-link";
 const INPUT_LINE_GAIN_NAME: &str = "input:line-gain";
 const INPUT_LINE_LEVEL_NAME: &str = "input:line-level";
 const INPUT_MIC_POWER_NAME: &str = "input:mic-power";
+const INPUT_MIC_GAIN_NAME: &str = "input:mic-gain";
 const INPUT_MIC_INST_NAME: &str = "input:mic-instrument";
 const INPUT_INVERT_PHASE_NAME: &str = "input:invert-phase";
 
@@ -135,10 +136,14 @@ pub struct LatterInputCtl<T>
 where
     T: RmeFfLatterInputSpecification
         + RmeFfWhollyCommandableParamsOperation<FfLatterInputState>
-        + RmeFfPartiallyCommandableParamsOperation<FfLatterInputState>,
+        + RmeFfPartiallyCommandableParamsOperation<FfLatterInputState>
+        + RmeFfLatterMicGainSpecification
+        + RmeFfPartiallyCommandableParamsOperation<FfLatterMicGainState>,
 {
     pub elem_id_list: Vec<ElemId>,
     params: FfLatterInputState,
+    // Never written at startup; the device keeps the gain set with its knob.
+    mic_gains: FfLatterMicGainState,
     _phantom: PhantomData<T>,
 }
 
@@ -146,12 +151,15 @@ impl<T> Default for LatterInputCtl<T>
 where
     T: RmeFfLatterInputSpecification
         + RmeFfWhollyCommandableParamsOperation<FfLatterInputState>
-        + RmeFfPartiallyCommandableParamsOperation<FfLatterInputState>,
+        + RmeFfPartiallyCommandableParamsOperation<FfLatterInputState>
+        + RmeFfLatterMicGainSpecification
+        + RmeFfPartiallyCommandableParamsOperation<FfLatterMicGainState>,
 {
     fn default() -> Self {
         Self {
             elem_id_list: Default::default(),
             params: T::create_input_parameters(),
+            mic_gains: T::create_mic_gain_parameters(),
             _phantom: Default::default(),
         }
     }
@@ -168,11 +176,20 @@ impl<T> LatterInputCtl<T>
 where
     T: RmeFfLatterInputSpecification
         + RmeFfWhollyCommandableParamsOperation<FfLatterInputState>
-        + RmeFfPartiallyCommandableParamsOperation<FfLatterInputState>,
+        + RmeFfPartiallyCommandableParamsOperation<FfLatterInputState>
+        + RmeFfLatterMicGainSpecification
+        + RmeFfPartiallyCommandableParamsOperation<FfLatterMicGainState>,
 {
     const INPUT_GAIN_TLV: DbInterval = DbInterval {
         min: 0,
         max: 1200,
+        linear: false,
+        mute_avail: false,
+    };
+
+    const MIC_GAIN_TLV: DbInterval = DbInterval {
+        min: 0,
+        max: 6000,
         linear: false,
         mute_avail: false,
     };
@@ -227,6 +244,20 @@ where
             .add_bool_elems(&elem_id, 1, T::MIC_INPUT_COUNT, true)
             .map(|mut elem_id_list| self.elem_id_list.append(&mut elem_id_list))?;
 
+        let elem_id = ElemId::new_by_name(ElemIfaceType::Mixer, 0, 0, INPUT_MIC_GAIN_NAME, 0);
+        card_cntr
+            .add_int_elems(
+                &elem_id,
+                1,
+                T::MIC_INPUT_GAIN_MIN,
+                T::MIC_INPUT_GAIN_MAX,
+                T::MIC_INPUT_GAIN_STEP,
+                T::MIC_INPUT_COUNT,
+                Some(&Vec::<u32>::from(&Self::MIC_GAIN_TLV)),
+                true,
+            )
+            .map(|mut elem_id_list| self.elem_id_list.append(&mut elem_id_list))?;
+
         let elem_id = ElemId::new_by_name(ElemIfaceType::Mixer, 0, 0, INPUT_MIC_INST_NAME, 0);
         card_cntr
             .add_bool_elems(&elem_id, 1, T::MIC_INPUT_COUNT, true)
@@ -274,6 +305,17 @@ where
             }
             INPUT_MIC_POWER_NAME => {
                 elem_value.set_bool(&self.params.mic_powers);
+                Ok(true)
+            }
+            INPUT_MIC_GAIN_NAME => {
+                // Not yet commanded (-1) reads as 0.
+                let vals: Vec<i32> = self
+                    .mic_gains
+                    .gains
+                    .iter()
+                    .map(|&gain| (gain as i32).max(0))
+                    .collect();
+                elem_value.set_int(&vals);
                 Ok(true)
             }
             INPUT_MIC_INST_NAME => {
@@ -351,6 +393,23 @@ where
                 debug!(params = ?self.params, ?res);
                 res.map(|_| true)
             }
+            INPUT_MIC_GAIN_NAME => {
+                let mut params = self.mic_gains.clone();
+                params
+                    .gains
+                    .iter_mut()
+                    .zip(elem_value.int())
+                    .for_each(|(d, &s)| {
+                        // An unknown gain reads as 0, so 0 written back to it means no change;
+                        // this keeps the knob setting of the other channel.
+                        if *d >= 0 || s != 0 {
+                            *d = s.clamp(T::MIC_INPUT_GAIN_MIN, T::MIC_INPUT_GAIN_MAX) as i16
+                        }
+                    });
+                let res = T::command_partially(req, node, &mut self.mic_gains, params, timeout_ms);
+                debug!(params = ?self.mic_gains, ?res);
+                res.map(|_| true)
+            }
             INPUT_MIC_INST_NAME => {
                 let mut params = self.params.clone();
                 params
@@ -408,6 +467,13 @@ where
             .vols
             .iter_mut()
             .for_each(|vol| *vol = T::PHYS_OUTPUT_VOL_ZERO as i16);
+        // Local change: line outputs 1/2 (main monitors) start at -40.0 dB to avoid loud
+        // surprises when the service (re)starts.
+        params
+            .vols
+            .iter_mut()
+            .take(2)
+            .for_each(|vol| *vol = -400);
 
         Self {
             elem_id_list: Default::default(),
@@ -3588,5 +3654,190 @@ where
             }
             _ => Ok(false),
         }
+    }
+}
+
+// Updates of cached parameters by reports from the DSP (hardware changes, e.g. the gain knob).
+// Each method returns true when any cached value changed, so that the caller can refresh the
+// elements of the control.
+
+impl<T> LatterInputCtl<T>
+where
+    T: RmeFfLatterInputSpecification
+        + RmeFfWhollyCommandableParamsOperation<FfLatterInputState>
+        + RmeFfPartiallyCommandableParamsOperation<FfLatterInputState>
+        + RmeFfLatterMicGainSpecification
+        + RmeFfPartiallyCommandableParamsOperation<FfLatterMicGainState>
+        + RmeFfCommandParamsParseReport<FfLatterInputState>
+        + RmeFfCommandParamsParseReport<FfLatterMicGainState>,
+{
+    pub fn parse_report(&mut self, report: &FfLatterDspReport) -> bool {
+        let a = <T as RmeFfCommandParamsParseReport<FfLatterInputState>>::parse_report(
+            &mut self.params,
+            report,
+        );
+        let b = <T as RmeFfCommandParamsParseReport<FfLatterMicGainState>>::parse_report(
+            &mut self.mic_gains,
+            report,
+        );
+        a || b
+    }
+}
+
+impl<T> LatterOutputCtl<T>
+where
+    T: RmeFfLatterOutputSpecification
+        + RmeFfWhollyCommandableParamsOperation<FfLatterOutputState>
+        + RmeFfPartiallyCommandableParamsOperation<FfLatterOutputState>
+        + RmeFfCommandParamsParseReport<FfLatterOutputState>,
+{
+    pub fn parse_report(&mut self, report: &FfLatterDspReport) -> bool {
+        T::parse_report(&mut self.params, report)
+    }
+}
+
+impl<T> LatterFxSourceCtl<T>
+where
+    T: RmeFfLatterDspSpecification
+        + RmeFfLatterFxSpecification
+        + RmeFfWhollyCommandableParamsOperation<FfLatterFxSourceParameters>
+        + RmeFfPartiallyCommandableParamsOperation<FfLatterFxSourceParameters>
+        + RmeFfCommandParamsParseReport<FfLatterFxSourceParameters>,
+{
+    pub fn parse_report(&mut self, report: &FfLatterDspReport) -> bool {
+        T::parse_report(&mut self.params, report)
+    }
+}
+
+impl<T> LatterFxOutputCtl<T>
+where
+    T: RmeFfLatterDspSpecification
+        + RmeFfLatterFxSpecification
+        + RmeFfWhollyCommandableParamsOperation<FfLatterFxOutputParameters>
+        + RmeFfPartiallyCommandableParamsOperation<FfLatterFxOutputParameters>
+        + RmeFfCommandParamsParseReport<FfLatterFxOutputParameters>,
+{
+    pub fn parse_report(&mut self, report: &FfLatterDspReport) -> bool {
+        T::parse_report(&mut self.params, report)
+    }
+}
+
+impl<T> LatterFxReverbCtl<T>
+where
+    T: RmeFfLatterFxSpecification
+        + RmeFfWhollyCommandableParamsOperation<FfLatterFxReverbState>
+        + RmeFfPartiallyCommandableParamsOperation<FfLatterFxReverbState>
+        + RmeFfCommandParamsParseReport<FfLatterFxReverbState>,
+{
+    pub fn parse_report(&mut self, report: &FfLatterDspReport) -> bool {
+        T::parse_report(&mut self.params, report)
+    }
+}
+
+impl<T> LatterFxEchoCtl<T>
+where
+    T: RmeFfLatterFxSpecification
+        + RmeFfWhollyCommandableParamsOperation<FfLatterFxEchoState>
+        + RmeFfPartiallyCommandableParamsOperation<FfLatterFxEchoState>
+        + RmeFfCommandParamsParseReport<FfLatterFxEchoState>,
+{
+    pub fn parse_report(&mut self, report: &FfLatterDspReport) -> bool {
+        T::parse_report(&mut self.params, report)
+    }
+}
+
+const INPUT_MUTE_NAME: &str = "input:mute";
+
+/// Mute of physical inputs. On the UCX a muted input does not reach the FX bus.
+#[derive(Debug)]
+pub struct LatterInputMuteCtl<T>
+where
+    T: RmeFfLatterInputMuteSpecification
+        + RmeFfWhollyCommandableParamsOperation<FfLatterInputMuteState>
+        + RmeFfPartiallyCommandableParamsOperation<FfLatterInputMuteState>
+        + RmeFfCommandParamsParseReport<FfLatterInputMuteState>,
+{
+    pub elem_id_list: Vec<ElemId>,
+    params: FfLatterInputMuteState,
+    _phantom: PhantomData<T>,
+}
+
+impl<T> Default for LatterInputMuteCtl<T>
+where
+    T: RmeFfLatterInputMuteSpecification
+        + RmeFfWhollyCommandableParamsOperation<FfLatterInputMuteState>
+        + RmeFfPartiallyCommandableParamsOperation<FfLatterInputMuteState>
+        + RmeFfCommandParamsParseReport<FfLatterInputMuteState>,
+{
+    fn default() -> Self {
+        Self {
+            elem_id_list: Default::default(),
+            params: T::create_input_mute_parameters(),
+            _phantom: Default::default(),
+        }
+    }
+}
+
+impl<T> LatterInputMuteCtl<T>
+where
+    T: RmeFfLatterInputMuteSpecification
+        + RmeFfWhollyCommandableParamsOperation<FfLatterInputMuteState>
+        + RmeFfPartiallyCommandableParamsOperation<FfLatterInputMuteState>
+        + RmeFfCommandParamsParseReport<FfLatterInputMuteState>,
+{
+    pub fn cache(
+        &mut self,
+        req: &mut FwReq,
+        node: &mut FwNode,
+        timeout_ms: u32,
+    ) -> Result<(), Error> {
+        let res = T::command_wholly(req, node, &mut self.params, timeout_ms);
+        debug!(params = ?self.params, ?res);
+        res
+    }
+
+    pub fn load(&mut self, card_cntr: &mut CardCntr) -> Result<(), Error> {
+        let elem_id = ElemId::new_by_name(ElemIfaceType::Mixer, 0, 0, INPUT_MUTE_NAME, 0);
+        card_cntr
+            .add_bool_elems(&elem_id, 1, T::PHYS_INPUT_COUNT, true)
+            .map(|mut elem_id_list| self.elem_id_list.append(&mut elem_id_list))
+    }
+
+    pub fn read(&self, elem_id: &ElemId, elem_value: &mut ElemValue) -> Result<bool, Error> {
+        match elem_id.name().as_str() {
+            INPUT_MUTE_NAME => {
+                elem_value.set_bool(&self.params.mutes);
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    pub fn write(
+        &mut self,
+        req: &mut FwReq,
+        node: &mut FwNode,
+        elem_id: &ElemId,
+        elem_value: &ElemValue,
+        timeout_ms: u32,
+    ) -> Result<bool, Error> {
+        match elem_id.name().as_str() {
+            INPUT_MUTE_NAME => {
+                let mut params = self.params.clone();
+                params
+                    .mutes
+                    .iter_mut()
+                    .zip(elem_value.boolean())
+                    .for_each(|(d, s)| *d = s);
+                let res = T::command_partially(req, node, &mut self.params, params, timeout_ms);
+                debug!(params = ?self.params, ?res);
+                res.map(|_| true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    pub fn parse_report(&mut self, report: &FfLatterDspReport) -> bool {
+        T::parse_report(&mut self.params, report)
     }
 }

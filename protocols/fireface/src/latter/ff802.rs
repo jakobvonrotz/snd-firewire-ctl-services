@@ -525,4 +525,34 @@ mod test {
 
         assert_eq!(target, orig);
     }
+
+    // DSP readback: the 802 uses the same reports as the UCX (same TotalMix FX command
+    // tables), on its own channel layout (line inputs 0-7, mic inputs 8-11).
+    #[test]
+    fn dsp_report_channels() {
+        fn report(w: u32) -> FfLatterDspReport {
+            let w = if w.count_ones() % 2 == 0 { w | 0x80000000 } else { w };
+            FfLatterDspReport::parse(w).unwrap()
+        }
+
+        // AN 10 (mic 2) gain at 30 dB.
+        let mut gains = Ff802Protocol::create_mic_gain_parameters();
+        assert!(Ff802Protocol::parse_report(&mut gains, &report(0x0907012c)));
+        assert_eq!(gains.gains[1], 300);
+        // A line input gain report does not touch the mic gains.
+        assert!(!Ff802Protocol::parse_report(&mut gains, &report(0x02070020)));
+
+        // AN 3 line gain, input mute of input 5.
+        let mut inputs = Ff802Protocol::create_input_parameters();
+        assert!(Ff802Protocol::parse_report(&mut inputs, &report(0x02070020)));
+        assert_eq!(inputs.line_gains[2], 0x20);
+        let mut mutes = Ff802Protocol::create_input_mute_parameters();
+        assert!(Ff802Protocol::parse_report(&mut mutes, &report(0x04000001)));
+        assert!(mutes.mutes[4]);
+
+        // Output 1 volume (outputs start at ch 30 on the 802).
+        let mut outputs = Ff802Protocol::create_output_parameters();
+        assert!(Ff802Protocol::parse_report(&mut outputs, &report(0x1e00fd76)));
+        assert_eq!(outputs.vols[0], -650);
+    }
 }

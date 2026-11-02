@@ -16,11 +16,29 @@ enum Event {
     BusReset(u32),
     Elem(ElemId, ElemEventMask),
     Timer,
+    DspReport,
+}
+
+/// Model which reads parameter reports from the DSP, so that changes made at the hardware (e.g.
+/// the gain knob) reach the elements.
+pub trait DspReportModel<O> {
+    /// Whether to poll the reports periodically.
+    fn dsp_report_available(&self) -> bool {
+        false
+    }
+
+    /// Poll the reports, update the cached state, and add the elements to refresh.
+    fn poll_dsp_reports(&mut self, _: &mut O, _: &mut Vec<ElemId>) -> Result<(), Error> {
+        Ok(())
+    }
 }
 
 pub struct FfLatterRuntime<T>
 where
-    T: Default + CtlModel<(SndFireface, FwNode)> + MeasureModel<(SndFireface, FwNode)>,
+    T: Default
+        + CtlModel<(SndFireface, FwNode)>
+        + MeasureModel<(SndFireface, FwNode)>
+        + DspReportModel<(SndFireface, FwNode)>,
 {
     unit: (SndFireface, FwNode),
     model: T,
@@ -30,11 +48,15 @@ where
     dispatchers: Vec<Dispatcher>,
     timer: Option<Dispatcher>,
     measured_elem_id_list: Vec<ElemId>,
+    reported_elem_id_list: Vec<ElemId>,
 }
 
 impl<T> FfLatterRuntime<T>
 where
-    T: Default + CtlModel<(SndFireface, FwNode)> + MeasureModel<(SndFireface, FwNode)>,
+    T: Default
+        + CtlModel<(SndFireface, FwNode)>
+        + MeasureModel<(SndFireface, FwNode)>
+        + DspReportModel<(SndFireface, FwNode)>,
 {
     pub(crate) fn new(unit: SndFireface, node: FwNode, card_cntr: CardCntr) -> Result<Self, Error> {
         // Use uni-directional channel for communication to child threads.
@@ -49,6 +71,7 @@ where
             dispatchers: Default::default(),
             timer: None,
             measured_elem_id_list: Default::default(),
+            reported_elem_id_list: Default::default(),
         };
 
         Ok(runtime)
@@ -73,6 +96,10 @@ where
         }
 
         enter.exit();
+
+        if self.model.dsp_report_available() {
+            self.launch_dsp_report_dispatcher()?;
+        }
 
         Ok(())
     }
@@ -122,6 +149,22 @@ where
                                 });
                         }
                     }
+                    Event::DspReport => {
+                        let _enter = debug_span!("dsp-report").entered();
+                        self.reported_elem_id_list.clear();
+                        let res = self
+                            .model
+                            .poll_dsp_reports(&mut self.unit, &mut self.reported_elem_id_list);
+                        if let Err(e) = res {
+                            debug!("poll of DSP reports failed: {}", e);
+                        }
+                        if !self.reported_elem_id_list.is_empty() {
+                            let _ = self.card_cntr.refresh_elems::<(SndFireface, FwNode), _>(
+                                &self.reported_elem_id_list,
+                                &mut self.model,
+                            );
+                        }
+                    }
                     Event::Timer => {
                         let _enter = debug_span!("timer").entered();
                         let _ = self.card_cntr.measure_elems(
@@ -142,7 +185,10 @@ where
 
 impl<T> Drop for FfLatterRuntime<T>
 where
-    T: Default + CtlModel<(SndFireface, FwNode)> + MeasureModel<(SndFireface, FwNode)>,
+    T: Default
+        + CtlModel<(SndFireface, FwNode)>
+        + MeasureModel<(SndFireface, FwNode)>
+        + DspReportModel<(SndFireface, FwNode)>,
 {
     fn drop(&mut self) {
         // At first, stop event loop in all of dispatchers to avoid queueing new events.
@@ -160,7 +206,10 @@ where
 
 impl<T> FfLatterRuntime<T>
 where
-    T: Default + CtlModel<(SndFireface, FwNode)> + MeasureModel<(SndFireface, FwNode)>,
+    T: Default
+        + CtlModel<(SndFireface, FwNode)>
+        + MeasureModel<(SndFireface, FwNode)>
+        + DspReportModel<(SndFireface, FwNode)>,
 {
     fn launch_node_event_dispatcher(&mut self) -> Result<(), Error> {
         let name = NODE_DISPATCHER_NAME.to_string();
@@ -207,6 +256,18 @@ where
 
         self.dispatchers.push(dispatcher);
 
+        Ok(())
+    }
+
+    fn launch_dsp_report_dispatcher(&mut self) -> Result<(), Error> {
+        let mut dispatcher = Dispatcher::run(DSP_REPORT_DISPATCHER_NAME.to_string())?;
+        let tx = self.tx.clone();
+        dispatcher.attach_interval_handler(DSP_REPORT_INTERVAL, move || {
+            // Skip the tick when the queue is full, rather than block.
+            let _ = tx.try_send(Event::DspReport);
+            glib::ControlFlow::Continue
+        });
+        self.dispatchers.push(dispatcher);
         Ok(())
     }
 

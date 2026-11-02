@@ -651,6 +651,43 @@ impl CardCntr {
         })
     }
 
+    /// Refresh the given elements from the cached state of the model, after the model updated the
+    /// state by itself (e.g. by reports from the hardware). Unlike measure_elems, only elements
+    /// whose value differs are written, and the local copy of the value is updated so that the
+    /// resulting element event does not go back to the hardware.
+    pub fn refresh_elems<O, T>(
+        &mut self,
+        elem_id_list: &[ElemId],
+        ctl_model: &mut T,
+    ) -> Result<(), Error>
+    where
+        O: Sized,
+        T: CtlModel<O>,
+    {
+        let card = &self.card;
+        let entries = &mut self.entries;
+
+        elem_id_list.iter().try_for_each(|elem_id| {
+            entries
+                .iter_mut()
+                .filter(|(elem_info, _)| match_elem_id(elem_info, elem_id))
+                .try_for_each(|(elem_info, v)| {
+                    // ElemValue is a GObject; clone() would share it, so use a new one.
+                    let mut val = ElemValue::new();
+                    if !ctl_model.read(elem_id, &mut val)? || v.equal(&val) {
+                        return Ok(());
+                    }
+                    let res = card.write_elem_value(elem_id, &val);
+                    debug!(
+                        numid = elem_id.numid(),
+                        values = value_array_literal(elem_info, &val),
+                        ?res,
+                    );
+                    res.map(|_| *v = val)
+                })
+        })
+    }
+
     pub fn dispatch_notification<O, N, T>(
         &mut self,
         unit: &mut O,

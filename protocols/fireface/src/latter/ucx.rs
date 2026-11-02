@@ -353,6 +353,10 @@ impl RmeFfCacheableParamsOperation<FfUcxStatus> for FfUcxProtocol {
 impl RmeFfLatterSpecification for FfUcxProtocol {
     const LINE_INPUT_COUNT: usize = 6;
     const MIC_INPUT_COUNT: usize = 2;
+    // The microphone preamps (front inputs 1-2) are at channel 0-1; confirmed by the phantom
+    // powering command (0x08) to channel 1 lighting the 48V LED of input 2.
+    const LINE_INPUT_OFFSET: usize = 2;
+    const MIC_INPUT_OFFSET: usize = 0;
     const SPDIF_INPUT_COUNT: usize = 2;
     const ADAT_INPUT_COUNT: usize = 8;
     const STREAM_INPUT_COUNT: usize = 18;
@@ -362,11 +366,135 @@ impl RmeFfLatterSpecification for FfUcxProtocol {
     const HP_OUTPUT_COUNT: usize = 2;
     const SPDIF_OUTPUT_COUNT: usize = 2;
     const ADAT_OUTPUT_COUNT: usize = 8;
+
+    // 20 octlets, 20 quadlets for levels, the previous tag, then 3 quadlets for the tag.
+    const METER_CHUNK_SIZE: usize = 256;
+    const METER_LEVEL_OFFSET: usize = 160;
 }
 
 #[cfg(test)]
 mod test {
     use super::*;
+
+    fn parity(w: u32) -> u32 {
+        if w.count_ones() % 2 == 0 {
+            w | 0x80000000
+        } else {
+            w
+        }
+    }
+
+    // Parse serialized commands as reports into default parameters; they must come out equal.
+    fn roundtrip<T: Clone + PartialEq + std::fmt::Debug>(default: T, params: T, cmds: Vec<u32>)
+    where
+        FfUcxProtocol: RmeFfCommandParamsParseReport<T>,
+    {
+        let mut parsed = default;
+        cmds.iter().for_each(|&w| {
+            let report = FfLatterDspReport::parse(parity(w)).unwrap();
+            FfUcxProtocol::parse_report(&mut parsed, &report);
+        });
+        assert_eq!(parsed, params);
+    }
+
+    #[test]
+    fn dsp_report_parse() {
+        // MIC 2 gain at 30 dB, reported after turning the knob.
+        let report = FfLatterDspReport::parse(0x8107012c).unwrap();
+        assert_eq!(report, FfLatterDspReport { ch: 1, cmd: 7, value: 300 });
+        // Negative value.
+        let report = FfLatterDspReport::parse(parity(0x1203fd76)).unwrap();
+        assert_eq!(report.value, -650);
+        // Status words and wrong parity are dropped.
+        assert_eq!(FfLatterDspReport::parse(0x3f001a00), None);
+        assert_eq!(FfLatterDspReport::parse(0xbf030000), None);
+        assert_eq!(FfLatterDspReport::parse(0x0107012c), None);
+
+        let mut gains = FfUcxProtocol::create_mic_gain_parameters();
+        assert!(FfUcxProtocol::parse_report(
+            &mut gains,
+            &FfLatterDspReport::parse(0x8107012c).unwrap()
+        ));
+        assert_eq!(gains.gains, vec![-1, 300]);
+    }
+
+    #[test]
+    fn dsp_report_roundtrip() {
+        let mut params = FfUcxProtocol::create_input_parameters();
+        params.stereo_links[1] = true;
+        params.invert_phases[3] = true;
+        params.line_gains[2] = 55;
+        params.line_levels[1] = LatterInNominalLevel::Professional;
+        params.mic_powers[1] = true;
+        let cmds = FfUcxProtocol::serialize_commands(&params);
+        roundtrip(FfUcxProtocol::create_input_parameters(), params, cmds);
+
+        let mut params = FfUcxProtocol::create_input_mute_parameters();
+        params.mutes[4] = true;
+        let cmds = FfUcxProtocol::serialize_commands(&params);
+        roundtrip(FfUcxProtocol::create_input_mute_parameters(), params, cmds);
+
+        let mut params = FfUcxProtocol::create_output_parameters();
+        params.vols[0] = -216;
+        params.vols[7] = 30;
+        params.stereo_balance[1] = -40;
+        params.stereo_links[2] = true;
+        params.invert_phases[5] = true;
+        params.line_levels[3] = LineOutNominalLevel::High;
+        let cmds = FfUcxProtocol::serialize_commands(&params);
+        roundtrip(FfUcxProtocol::create_output_parameters(), params, cmds);
+
+        let mut params = FfUcxProtocol::create_fx_sources_parameters();
+        params.line_input_gains[1] = -100;
+        params.mic_input_gains[1] = -650;
+        params.spdif_input_gains[0] = -10;
+        params.adat_input_gains[7] = -20;
+        // Stream sources are virtual ports and never reported.
+        let cmds: Vec<u32> = FfUcxProtocol::serialize_commands(&params)
+            .into_iter()
+            .filter(|w| w & 0x40000000 == 0)
+            .collect();
+        roundtrip(FfUcxProtocol::create_fx_sources_parameters(), params, cmds);
+
+        let mut params = FfUcxProtocol::create_fx_output_parameters();
+        params.line_output_vols[0] = -1;
+        params.hp_output_vols[1] = -2;
+        params.spdif_output_vols[0] = -3;
+        params.adat_output_vols[7] = -4;
+        let cmds = FfUcxProtocol::serialize_commands(&params);
+        roundtrip(FfUcxProtocol::create_fx_output_parameters(), params, cmds);
+
+        let params = FfLatterFxReverbState {
+            activate: true,
+            reverb_type: FfLatterFxReverbType::Gated,
+            pre_delay: 999,
+            pre_hpf: 120,
+            room_scale: 250,
+            attack: 5,
+            hold: 300,
+            release: 500,
+            post_lpf: 15000,
+            time: 30,
+            damping: 9000,
+            smooth: 50,
+            volume: -120,
+            stereo_width: 100,
+        };
+        let cmds = FfUcxProtocol::serialize_commands(&params);
+        roundtrip(FfLatterFxReverbState::default(), params, cmds);
+
+        let params = FfLatterFxEchoState {
+            activate: true,
+            echo_type: FfLatterFxEchoType::PongEcho,
+            delay: 50,
+            feedback: 50,
+            lpf: FfLatterFxEchoLpfFreq::H4000,
+            volume: -30,
+            stereo_width: 100,
+        };
+        let cmds = FfUcxProtocol::serialize_commands(&params);
+        roundtrip(FfLatterFxEchoState::default(), params, cmds);
+    }
 
     #[test]
     fn clock_source_serdes() {
@@ -477,5 +605,128 @@ mod test {
         FfUcxProtocol::deserialize_offsets(&mut target, &raw);
 
         assert_eq!(target, orig);
+    }
+
+    #[test]
+    fn meter_chunk_layout() {
+        // Captured from the UCX: 20 octlets, 20 quadlets of levels, the previous tag, then
+        // three quadlets for the current tag.
+        let chunk = |tag: u32, prev: u32, levels: &[(usize, u32)]| {
+            let mut raw = vec![0u8; FfUcxProtocol::METER_CHUNK_SIZE];
+            levels.iter().for_each(|&(i, v)| {
+                let pos = 160 + i * 4;
+                raw[pos..(pos + 4)].copy_from_slice(&v.to_le_bytes());
+            });
+            raw[240..244].copy_from_slice(&prev.to_le_bytes());
+            (61..64).for_each(|q| raw[(q * 4)..(q * 4 + 4)].copy_from_slice(&tag.to_le_bytes()));
+            raw
+        };
+
+        let mut state = FfUcxProtocol::create_meter_state();
+
+        let raw = chunk(0x33333333, 0x22222222, &[(0, 0x00379790), (1, 0x00379740)]);
+        FfUcxProtocol::deserialize_offsets(&mut state, &raw);
+        assert_eq!(state.stream_inputs[0], 0x00379790);
+        assert_eq!(state.stream_inputs[1], 0x00379740);
+        assert_eq!(state.stream_inputs[2], 0);
+
+        // Microphone inputs 1-2 come first, then line inputs 3-8.
+        let raw = chunk(0x66666666, 0x55555555, &[(1, 0x01234560), (6, 0x00000da0), (17, 0x7fffff0)]);
+        FfUcxProtocol::deserialize_offsets(&mut state, &raw);
+        assert_eq!(state.mic_inputs[1], 0x01234560);
+        assert_eq!(state.line_inputs[4], 0x00000da0);
+        assert_eq!(state.adat_inputs[7], 0x07fffff0);
+
+        let raw = chunk(0x11111111, 0x22666666, &[(0, 0x76d0), (6, 0x100), (17, 0x200)]);
+        FfUcxProtocol::deserialize_offsets(&mut state, &raw);
+        assert_eq!(state.line_outputs[0], 0x76d0);
+        assert_eq!(state.hp_outputs[0], 0x100);
+        assert_eq!(state.adat_outputs[7], 0x200);
+    }
+
+    #[test]
+    fn mixer_source_channel_layout() {
+        // Stream and fx return sources are at fixed channel offsets in each mixer, independent
+        // of the number of physical inputs (18 in UCX).
+        let mut state = FfUcxProtocol::create_mixer_parameters();
+        state.0[1].adat_gains[7] = 0x9001;
+        state.0[1].fx_return_gains[0] = 0x9002;
+        state.0[1].fx_return_gains[1] = 0x9003;
+        state.0[1].stream_gains[0] = 0x9004;
+        state.0[1].stream_gains[17] = 0x9005;
+
+        let cmds = FfUcxProtocol::serialize_commands(&state);
+        assert_eq!(
+            cmds.len(),
+            FfUcxProtocol::OUTPUT_COUNT * (18 + 2 + 18),
+        );
+
+        let addr_of = |coef: u32| {
+            let cmd = cmds.iter().find(|&&cmd| cmd & 0xffff == coef).unwrap();
+            ((cmd & 0x3fffffff) >> 16) as u16
+        };
+        let base = FfUcxProtocol::MIXER_STEP;
+        assert_eq!(addr_of(0x9001), base + 17);
+        assert_eq!(addr_of(0x9002), base + 0x1e);
+        assert_eq!(addr_of(0x9003), base + 0x1f);
+        assert_eq!(addr_of(0x9004), base + 0x20);
+        assert_eq!(addr_of(0x9005), base + 0x20 + 17);
+    }
+
+    #[test]
+    fn input_channel_order() {
+        // The microphone preamps are at channel 0-1, line inputs at 2-7, digital inputs from 8.
+        let phys_ch = |cmd: u32| ((cmd & 0x7fffffff) >> 24) as u8;
+        let phys_cmd = |cmd: u32| ((cmd >> 16) & 0xff) as u8;
+
+        let mut state = FfUcxProtocol::create_input_parameters();
+        state.mic_powers[1] = true;
+        state.line_levels[0] = LatterInNominalLevel::Professional;
+        let cmds = FfUcxProtocol::serialize_commands(&state);
+        let set = |cmd_code: u8, ch: u8| {
+            cmds.iter()
+                .find(|&&c| phys_cmd(c) == cmd_code && phys_ch(c) == ch)
+                .map(|&c| c & 0xffff)
+        };
+        // Phantom powering for input 2 at channel 1, line level of input 3 at channel 2.
+        assert_eq!(set(0x08, 1), Some(1));
+        assert_eq!(set(0x08, 0), Some(0));
+        assert_eq!(set(0x08, 2), Some(1));
+        assert_eq!(set(0x08, 6), Some(0));
+        assert_eq!(set(0x08, 7), Some(0));
+
+        let mut params = FfUcxProtocol::create_fx_sources_parameters();
+        params.mic_input_gains[1] = 0x101;
+        params.line_input_gains[0] = 0x102;
+        params.spdif_input_gains[0] = 0x103;
+        let cmds = FfUcxProtocol::serialize_commands(&params);
+        let ch_of = |coef: u32| phys_ch(*cmds.iter().find(|&&c| c & 0xffff == coef).unwrap());
+        assert_eq!(ch_of(0x101), 1);
+        assert_eq!(ch_of(0x102), 2);
+        assert_eq!(ch_of(0x103), 8);
+
+        let mut mixer = FfUcxProtocol::create_mixer_parameters();
+        mixer.0[0].mic_gains[1] = 0x9011;
+        mixer.0[0].line_gains[5] = 0x9012;
+        mixer.0[0].spdif_gains[0] = 0x9013;
+        let cmds = FfUcxProtocol::serialize_commands(&mixer);
+        let addr_of = |coef: u32| {
+            let cmd = cmds.iter().find(|&&cmd| cmd & 0xffff == coef).unwrap();
+            ((cmd & 0x3fffffff) >> 16) as u16
+        };
+        assert_eq!(addr_of(0x9011), 1);
+        assert_eq!(addr_of(0x9012), 7);
+        assert_eq!(addr_of(0x9013), 8);
+    }
+
+    #[test]
+    fn mic_gain_command() {
+        // Confirmed on the device: command 0x07 at channel 0/1, value in 0.1 dB (430 = 43 dB).
+        let mut state = FfUcxProtocol::create_mic_gain_parameters();
+        assert_eq!(state.gains, vec![-1, -1]);
+        state.gains[0] = 20;
+        state.gains[1] = 430;
+        let cmds = FfUcxProtocol::serialize_commands(&state);
+        assert_eq!(cmds, vec![0x0007_0014, 0x0107_01ae]);
     }
 }
