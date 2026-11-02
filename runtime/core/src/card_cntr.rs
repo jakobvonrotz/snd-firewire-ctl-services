@@ -11,7 +11,9 @@ use {
 #[derive(Default)]
 pub struct CardCntr {
     pub card: Card,
-    entries: Vec<(ElemInfo, ElemValue)>,
+    // The element id is kept with each entry: getting it from ElemInfo is a GObject
+    // property lookup, too slow for the comparisons done on every measurement.
+    entries: Vec<(ElemInfo, ElemValue, ElemId)>,
 }
 
 pub trait CtlModel<O: Sized> {
@@ -40,9 +42,8 @@ impl Drop for CardCntr {
     fn drop(&mut self) {
         self.entries
             .iter()
-            .filter_map(|(elem_info, _)| elem_id_from_elem_info(elem_info))
-            .for_each(|elem_id| {
-                let _ = self.card.remove_elems(&elem_id);
+            .for_each(|(_, _, elem_id)| {
+                let _ = self.card.remove_elems(elem_id);
             });
     }
 }
@@ -56,12 +57,6 @@ fn elem_id_from_elem_info(elem_info: &ElemInfo) -> Option<ElemId> {
         ElemInfo::Integer64(info) => info.elem_id(),
         ElemInfo::Enumerated(info) => info.elem_id(),
     }
-}
-
-fn match_elem_id(elem_info: &ElemInfo, elem_id: &ElemId) -> bool {
-    elem_id_from_elem_info(elem_info)
-        .map(|e| e.eq(elem_id))
-        .unwrap_or_default()
 }
 
 fn dump_elem_info(elem_info: &ElemInfo) {
@@ -440,7 +435,7 @@ impl CardCntr {
                             dump_elem_info(&elem_info);
                         }
 
-                        self.entries.push((elem_info, v));
+                        self.entries.push((elem_info, v, elem_id.clone()));
                         Ok(())
                     }
                     None => {
@@ -491,15 +486,15 @@ impl CardCntr {
             debug!(numid = ?elem_id.numid());
 
             self.entries
-                .retain(|(elem_info, _)| match_elem_id(elem_info, elem_id));
+                .retain(|(_, _, id)| *id == *elem_id);
             return Ok(());
         }
 
         if events.contains(ElemEventMask::ADD) {
             let _enter = debug_span!("add").entered();
 
-            for (elem_info, v) in &mut self.entries {
-                if !match_elem_id(elem_info, elem_id) {
+            for (elem_info, v, id) in &mut self.entries {
+                if *id != *elem_id {
                     continue;
                 }
 
@@ -544,8 +539,8 @@ impl CardCntr {
         if events.contains(ElemEventMask::VALUE) {
             let _enter = debug_span!("value").entered();
 
-            for (elem_info, v) in &mut self.entries {
-                if !match_elem_id(elem_info, elem_id) {
+            for (elem_info, v, id) in &mut self.entries {
+                if *id != *elem_id {
                     continue;
                 }
 
@@ -623,8 +618,8 @@ impl CardCntr {
         elem_id_list.iter().try_for_each(|elem_id| {
             entries
                 .iter_mut()
-                .filter(|(elem_info, _)| match_elem_id(elem_info, elem_id))
-                .try_for_each(|(elem_info, elem_value)| {
+                .filter(|(_, _, id)| *id == *elem_id)
+                .try_for_each(|(elem_info, elem_value, _)| {
                     let _enter = debug_span!("hardware").entered();
 
                     let res = ctl_model.read(elem_id, elem_value);
@@ -670,8 +665,8 @@ impl CardCntr {
         elem_id_list.iter().try_for_each(|elem_id| {
             entries
                 .iter_mut()
-                .filter(|(elem_info, _)| match_elem_id(elem_info, elem_id))
-                .try_for_each(|(elem_info, v)| {
+                .filter(|(_, _, id)| *id == *elem_id)
+                .try_for_each(|(elem_info, v, _)| {
                     // ElemValue is a GObject; clone() would share it, so use a new one.
                     let mut val = ElemValue::new();
                     if !ctl_model.read(elem_id, &mut val)? || v.equal(&val) {
@@ -709,8 +704,8 @@ impl CardCntr {
         elem_id_list.iter().try_for_each(|elem_id| {
             entries
                 .iter_mut()
-                .filter(|(elem_info, _)| match_elem_id(elem_info, elem_id))
-                .try_for_each(|(elem_info, elem_value)| {
+                .filter(|(_, _, id)| *id == *elem_id)
+                .try_for_each(|(elem_info, elem_value, _)| {
                     let _enter = debug_span!("hardware").entered();
                     let res = ctl_model.read(elem_id, elem_value);
                     debug!(
