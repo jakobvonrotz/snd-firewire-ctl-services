@@ -10,6 +10,7 @@ use {
 pub struct UcxModel {
     req: FwReq,
     meter_ctl: LatterMeterCtl<FfUcxProtocol>,
+    dyn_meter_ctl: LatterDynamicsMeterCtl<FfUcxProtocol>,
     cfg_ctl: CfgCtl,
     status_ctl: StatusCtl,
     input_ctl: LatterInputCtl<FfUcxProtocol>,
@@ -60,6 +61,7 @@ impl CtlModel<(SndFireface, FwNode)> for UcxModel {
 
     fn load(&mut self, card_cntr: &mut CardCntr) -> Result<(), Error> {
         self.meter_ctl.load(card_cntr)?;
+        self.dyn_meter_ctl.load(card_cntr)?;
         self.cfg_ctl.load(card_cntr)?;
         self.status_ctl.load(card_cntr)?;
         self.input_ctl.load(card_cntr)?;
@@ -83,6 +85,8 @@ impl CtlModel<(SndFireface, FwNode)> for UcxModel {
 
     fn read(&mut self, elem_id: &ElemId, elem_value: &mut ElemValue) -> Result<bool, Error> {
         if self.meter_ctl.read(elem_id, elem_value)? {
+            Ok(true)
+        } else if self.dyn_meter_ctl.read(elem_id, elem_value)? {
             Ok(true)
         } else if self.cfg_ctl.read(elem_id, elem_value)? {
             Ok(true)
@@ -244,7 +248,19 @@ impl DspReportModel<(SndFireface, FwNode)> for UcxModel {
             FfUcxProtocol::request_dsp_state_dump(&mut self.req, node, TIMEOUT_MS)?;
         }
 
-        let reports = FfUcxProtocol::read_dsp_reports(&mut self.req, node, TIMEOUT_MS)?;
+        let words = FfUcxProtocol::read_dsp_words(&mut self.req, node, TIMEOUT_MS)?;
+
+        let mut dyn_meter_reported = false;
+        words.iter().for_each(|&w| dyn_meter_reported |= self.dyn_meter_ctl.parse_word(w));
+        if dyn_meter_reported {
+            // The service writes the element only when the levels differ.
+            elem_id_list.extend_from_slice(&self.dyn_meter_ctl.0);
+        }
+
+        let reports: Vec<FfLatterDspReport> = words
+            .into_iter()
+            .filter_map(FfLatterDspReport::parse)
+            .collect();
         if reports.is_empty() {
             return Ok(());
         }

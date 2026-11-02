@@ -123,6 +123,78 @@ where
     }
 }
 
+const INPUT_DYN_METER: &str = "meter:input-dynamics";
+const OUTPUT_DYN_METER: &str = "meter:output-dynamics";
+
+/// The levels at the detector of dynamics processors, as reported by the DSP.
+#[derive(Debug)]
+pub struct LatterDynamicsMeterCtl<T>(
+    pub Vec<ElemId>,
+    FfLatterDynamicsMeterState,
+    PhantomData<T>,
+)
+where
+    T: RmeFfLatterDynamicsMeterSpecification;
+
+impl<T: RmeFfLatterDynamicsMeterSpecification> Default for LatterDynamicsMeterCtl<T> {
+    fn default() -> Self {
+        Self(
+            Default::default(),
+            T::create_dynamics_meter_state(),
+            Default::default(),
+        )
+    }
+}
+
+impl<T: RmeFfLatterDynamicsMeterSpecification> LatterDynamicsMeterCtl<T> {
+    // About 0.832 dB per step, in 0.01 dB.
+    const LEVEL_TLV: DbInterval = DbInterval {
+        min: T::DYN_LEVEL_MIN as i32 * 8319 / 100,
+        max: T::DYN_LEVEL_MAX as i32 * 8319 / 100,
+        linear: false,
+        mute_avail: false,
+    };
+
+    pub fn load(&mut self, card_cntr: &mut CardCntr) -> Result<(), Error> {
+        [
+            (INPUT_DYN_METER, T::PHYS_INPUT_COUNT),
+            (OUTPUT_DYN_METER, T::OUTPUT_COUNT),
+        ]
+        .iter()
+        .try_for_each(|&(name, count)| {
+            let elem_id = ElemId::new_by_name(ElemIfaceType::Card, 0, 0, name, 0);
+            card_cntr
+                .add_int_elems(
+                    &elem_id,
+                    1,
+                    T::DYN_LEVEL_MIN as i32,
+                    T::DYN_LEVEL_MAX as i32,
+                    1,
+                    count,
+                    Some(&Vec::<u32>::from(&Self::LEVEL_TLV)),
+                    false,
+                )
+                .map(|mut elem_id_list| self.0.append(&mut elem_id_list))
+        })
+    }
+
+    pub fn read(&self, elem_id: &ElemId, elem_value: &mut ElemValue) -> Result<bool, Error> {
+        let levels = match elem_id.name().as_str() {
+            INPUT_DYN_METER => &self.1.inputs,
+            OUTPUT_DYN_METER => &self.1.outputs,
+            _ => return Ok(false),
+        };
+        let vals: Vec<i32> = levels.iter().map(|&l| l as i32).collect();
+        elem_value.set_int(&vals);
+        Ok(true)
+    }
+
+    /// Update the levels by a word read from the DSP FIFO. Return true when it has levels.
+    pub fn parse_word(&mut self, word: u32) -> bool {
+        T::parse_dynamics_meter_word(&mut self.1, word)
+    }
+}
+
 const INPUT_STEREO_LINK_NAME: &str = "input:stereo-link";
 const INPUT_LINE_GAIN_NAME: &str = "input:line-gain";
 const INPUT_LINE_LEVEL_NAME: &str = "input:line-level";

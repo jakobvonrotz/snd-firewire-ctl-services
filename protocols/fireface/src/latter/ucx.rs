@@ -729,4 +729,32 @@ mod test {
         let cmds = FfUcxProtocol::serialize_commands(&state);
         assert_eq!(cmds, vec![0x0007_0014, 0x0107_01ae]);
     }
+
+    #[test]
+    fn dynamics_meter_word() {
+        let mut state = FfUcxProtocol::create_dynamics_meter_state();
+        assert_eq!(state.inputs.len(), 18);
+        assert_eq!(state.outputs.len(), 18);
+
+        // Mic 2 active with signal, Mic 1 inactive (0x70 is above the maximum).
+        assert!(FfUcxProtocol::parse_dynamics_meter_word(&mut state, 0xbf1070de));
+        assert_eq!(state.inputs[0], i8::MIN);
+        assert_eq!(state.inputs[1], -34);
+
+        // Pair 0x1a covers the 3rd and 4th outputs.
+        assert!(FfUcxProtocol::parse_dynamics_meter_word(&mut state, parity(0x3f1aa870)));
+        assert_eq!(state.outputs[2], -88);
+        assert_eq!(state.outputs[3], i8::MIN);
+
+        // Just activated: 0x7f means no level yet.
+        assert!(FfUcxProtocol::parse_dynamics_meter_word(&mut state, parity(0x3f107f70)));
+        assert_eq!(state.inputs[0], i8::MIN);
+
+        // Other status words and channel reports are not levels.
+        assert!(!FfUcxProtocol::parse_dynamics_meter_word(&mut state, 0xbf500000));
+        assert!(!FfUcxProtocol::parse_dynamics_meter_word(&mut state, 0x3f001a11));
+        assert!(!FfUcxProtocol::parse_dynamics_meter_word(&mut state, parity(0x0107012c)));
+        // Wrong parity.
+        assert!(!FfUcxProtocol::parse_dynamics_meter_word(&mut state, 0x3f1070de));
+    }
 }

@@ -2334,6 +2334,20 @@ pub trait RmeFfLatterDspReportOperation: RmeFfLatterDspSpecification {
         node: &mut FwNode,
         timeout_ms: u32,
     ) -> Result<Vec<FfLatterDspReport>, Error> {
+        Self::read_dsp_words(req, node, timeout_ms).map(|words| {
+            words
+                .into_iter()
+                .filter_map(FfLatterDspReport::parse)
+                .collect()
+        })
+    }
+
+    /// Read the pending words from the FIFO, including status words.
+    fn read_dsp_words(
+        req: &mut FwReq,
+        node: &mut FwNode,
+        timeout_ms: u32,
+    ) -> Result<Vec<u32>, Error> {
         let mut raw = [0; 4];
         req.transaction(
             node,
@@ -2364,12 +2378,84 @@ pub trait RmeFfLatterDspReportOperation: RmeFfLatterDspSpecification {
 
         Ok(raw
             .chunks_exact(4)
-            .filter_map(|q| FfLatterDspReport::parse(u32::from_le_bytes([q[0], q[1], q[2], q[3]])))
+            .map(|q| u32::from_le_bytes([q[0], q[1], q[2], q[3]]))
             .collect())
     }
 }
 
 impl<O: RmeFfLatterDspSpecification> RmeFfLatterDspReportOperation for O {}
+
+// While the dynamics processor of a channel is active, the DSP reports the level at its detector
+// in status words. One word holds the levels of two channels: the higher byte is for the even
+// channel, the lower byte for the odd channel. The channels of physical inputs come first, then
+// the channels of outputs. When several pairs are active, the DSP reports one pair per FIFO read
+// in turn.
+const DSP_DYN_METER_CMD_BASE: u8 = 0x10;
+const DSP_DYN_METER_CMD_COUNT: u8 = 0x1e;
+const DSP_DYN_METER_LEVEL_MAX: i8 = 30;
+
+/// The levels at the detector of dynamics processors, reported by the DSP.
+#[derive(Default, Debug, Clone, PartialEq, Eq)]
+pub struct FfLatterDynamicsMeterState {
+    /// For physical inputs. The unit is about 0.832 dB (as TotalMix FX displays it).
+    pub inputs: Vec<i8>,
+    /// For outputs. The unit is the same.
+    pub outputs: Vec<i8>,
+}
+
+/// Specification of the levels at the detector of dynamics processors.
+pub trait RmeFfLatterDynamicsMeterSpecification: RmeFfLatterDspSpecification {
+    /// The level at no signal, or when the DSP reports no level.
+    const DYN_LEVEL_MIN: i8 = i8::MIN;
+    /// The maximum level.
+    const DYN_LEVEL_MAX: i8 = DSP_DYN_METER_LEVEL_MAX;
+
+    fn create_dynamics_meter_state() -> FfLatterDynamicsMeterState {
+        FfLatterDynamicsMeterState {
+            inputs: vec![Self::DYN_LEVEL_MIN; Self::PHYS_INPUT_COUNT],
+            outputs: vec![Self::DYN_LEVEL_MIN; Self::OUTPUT_COUNT],
+        }
+    }
+
+    /// Update the levels by a word read from the FIFO. Return true when the word has levels.
+    fn parse_dynamics_meter_word(state: &mut FfLatterDynamicsMeterState, word: u32) -> bool {
+        if word.count_ones() % 2 == 0 || word & VIRT_PORT_CMD_FLAG > 0 {
+            return false;
+        }
+        if ((word >> 24) & 0x3f) as u8 != DSP_STATUS_CH {
+            return false;
+        }
+        let cmd = ((word >> 16) & 0xff) as u8;
+        if cmd < DSP_DYN_METER_CMD_BASE || cmd >= DSP_DYN_METER_CMD_BASE + DSP_DYN_METER_CMD_COUNT
+        {
+            return false;
+        }
+        let pos = 2 * (cmd - DSP_DYN_METER_CMD_BASE) as usize;
+        [(word >> 8) as u8 as i8, word as u8 as i8]
+            .iter()
+            .enumerate()
+            .for_each(|(i, &raw)| {
+                // TotalMix FX handles any level above the maximum as no signal.
+                let level = if raw > Self::DYN_LEVEL_MAX {
+                    Self::DYN_LEVEL_MIN
+                } else {
+                    raw
+                };
+                let ch = pos + i;
+                let slot = if ch < Self::PHYS_INPUT_COUNT {
+                    state.inputs.get_mut(ch)
+                } else {
+                    state.outputs.get_mut(ch - Self::PHYS_INPUT_COUNT)
+                };
+                if let Some(slot) = slot {
+                    *slot = level;
+                }
+            });
+        true
+    }
+}
+
+impl<O: RmeFfLatterDspSpecification> RmeFfLatterDynamicsMeterSpecification for O {}
 
 /// Apply a report by the DSP to parameters.
 pub trait RmeFfCommandParamsParseReport<T> {
