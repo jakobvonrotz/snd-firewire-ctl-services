@@ -108,11 +108,14 @@ const SYSTEM_DISPATCHER_NAME: &str = "system event dispatcher";
 const TIMER_DISPATCHER_NAME: &str = "interval timer dispatcher";
 
 const DSP_REPORT_DISPATCHER_NAME: &str = "dsp report dispatcher";
-// TotalMix FX polls every about 20 ms.
-const DSP_REPORT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(25);
+// TotalMix FX polls every about 20 ms. At ~60 Hz, like the meters, so the dynamics
+// levels reach a 60 fps display without waiting.
+const DSP_REPORT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(16);
 
 const TIMER_NAME: &str = "metering";
-const TIMER_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+// ~60 Hz, the refresh rate of common displays. The device has new levels on every
+// read (a meter block read takes about 0.08 ms), so the poll interval sets the meter rate.
+const TIMER_INTERVAL: std::time::Duration = std::time::Duration::from_millis(16);
 
 fn spdif_iface_to_string(iface: &SpdifIface) -> String {
     match iface {
