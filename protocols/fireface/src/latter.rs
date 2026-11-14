@@ -394,12 +394,40 @@ fn create_virt_port_cmd(mixer_step: u16, mixer: u16, ch: u16, coef: u16) -> u32 
     VIRT_PORT_CMD_FLAG | (((mixer_step * mixer + ch) as u32) << 16) | (coef as u32)
 }
 
+/// The DSP acknowledges every command quadlet, but drops some when they arrive faster than it
+/// processes them: a back-to-back flood of ~1000 commands (~17k/s) loses a few of the last
+/// ones (measured on the UCX, 2026-11-14), which is how a full resync left settings behind.
+/// TotalMix queues at most 63 commands and sends them once per tick; at most 63 commands per
+/// 16 ms lost nothing in 18 000 commands. Writes below that rate go out without delay.
+const DSP_CMD_BURST: usize = 63;
+const DSP_CMD_WINDOW: std::time::Duration = std::time::Duration::from_millis(16);
+
+static DSP_CMD_PACER: std::sync::Mutex<Option<(std::time::Instant, usize)>> =
+    std::sync::Mutex::new(None);
+
+fn pace_dsp_cmd() {
+    let mut pacer = DSP_CMD_PACER.lock().unwrap_or_else(|e| e.into_inner());
+    let now = std::time::Instant::now();
+    match pacer.as_mut() {
+        Some((start, count)) if now.duration_since(*start) < DSP_CMD_WINDOW => {
+            if *count >= DSP_CMD_BURST {
+                std::thread::sleep(DSP_CMD_WINDOW - now.duration_since(*start));
+                *pacer = Some((std::time::Instant::now(), 1));
+            } else {
+                *count += 1;
+            }
+        }
+        _ => *pacer = Some((now, 1)),
+    }
+}
+
 fn write_dsp_cmd(
     req: &mut FwReq,
     node: &mut FwNode,
     mut cmd: u32,
     timeout_ms: u32,
 ) -> Result<(), Error> {
+    pace_dsp_cmd();
     // Add odd parity.
     if (0..32).fold(0x01, |count, shift| count ^ (cmd >> shift) & 0x1) > 0 {
         cmd |= ODD_PARITY_FLAG;
